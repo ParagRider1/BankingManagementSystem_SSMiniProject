@@ -1,655 +1,705 @@
-// server.c
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <pthread.h>
-#include <errno.h>
 #include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/file.h>
-#include <sys/time.h>
-#include <time.h>
-
+#include <stdbool.h>
 #include "common.h"
 
+//note initial : admin username: admin123 password: 1234
+
+// Forward declarations for handlers
+void handle_customer(int sock, Account *acc);
+void handle_employee(int sock, Account *acc);
+void handle_manager(int sock, Account *acc);
+void handle_admin(int sock, Account *acc);
+
+
 #define PORT 8080
-#define BACKLOG 10
+#define DATA_FILE "accounts.dat"
 
-/* Global DB file descriptors */
-int fd_acc = -1;
-int fd_loan = -1;
-int fd_wal = -1;
+// typedef struct {
+//     int id;
+//     char username[50];
+//     char password[50];
+//     char role[20];       // CUSTOMER, EMPLOYEE, MANAGER, ADMIN
+//     float balance;
+//     int loan_pending;    // 0 = none, 1 = requested, 2 = approved
+// } Account;
 
-/* Utility: ensure data dir and files exist */
-void ensure_files() {
-    system("mkdir -p data");
-    fd_acc = open(DB_ACC_FILE, O_RDWR | O_CREAT, 0666);
-    if (fd_acc < 0) { perror("open accounts"); exit(1); }
-    fd_loan = open(DB_LOAN_FILE, O_RDWR | O_CREAT, 0666);
-    if (fd_loan < 0) { perror("open loans"); exit(1); }
-    fd_wal = open(WAL_FILE, O_RDWR | O_CREAT | O_APPEND, 0666);
-    if (fd_wal < 0) { perror("open wal"); exit(1); }
+
+// Helper to send full message safely to socket (with newline support)
+void send_msg(int sock, const char *msg) {
+    size_t len = strlen(msg);
+    ssize_t sent = 0;
+    while (sent < (ssize_t)len) {
+        ssize_t n = write(sock, msg + sent, len - sent);
+        if (n <= 0) break;
+        sent += n;
+    }
 }
 
-/* Low-level record locking by record index and length (advisory) */
-int lock_by_offset(int fd, off_t start, off_t len, short lock_type) {
-    struct flock fl;
-    fl.l_type = lock_type; // F_RDLCK / F_WRLCK / F_UNLCK
-    fl.l_whence = SEEK_SET;
-    fl.l_start = start;
-    fl.l_len = len;
-    fl.l_pid = 0;
-    return fcntl(fd, F_SETLKW, &fl); // blocking
-}
 
-/* Helpers for account file (1-based indexing of records) */
-ssize_t read_account_by_no(int acc_no, Account *acc_out) {
-    off_t off = (off_t)(acc_no - 1) * sizeof(Account);
-    if (lseek(fd_acc, off, SEEK_SET) < 0) return -1;
-    return read(fd_acc, acc_out, sizeof(Account));
-}
-ssize_t write_account_by_no(int acc_no, Account *acc) {
-    off_t off = (off_t)(acc_no - 1) * sizeof(Account);
-    if (lseek(fd_acc, off, SEEK_SET) < 0) return -1;
-    ssize_t w = write(fd_acc, acc, sizeof(Account));
-    fsync(fd_acc);
-    return w;
-}
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* Helpers for loan file */
-ssize_t read_loan_by_id(int loan_id, Loan *loan_out) {
-    off_t off = (off_t)(loan_id - 1) * sizeof(Loan);
-    if (lseek(fd_loan, off, SEEK_SET) < 0) return -1;
-    return read(fd_loan, loan_out, sizeof(Loan));
-}
-ssize_t write_loan_by_id(int loan_id, Loan *loan) {
-    off_t off = (off_t)(loan_id - 1) * sizeof(Loan);
-    if (lseek(fd_loan, off, SEEK_SET) < 0) return -1;
-    ssize_t w = write(fd_loan, loan, sizeof(Loan));
-    fsync(fd_loan);
-    return w;
-}
 
-/* Allocate next account number (append) */
-int next_account_no() {
-    struct stat st;
-    fstat(fd_acc, &st);
-    return (int)(st.st_size / sizeof(Account)) + 1;
-}
-int next_loan_id() {
-    struct stat st;
-    fstat(fd_loan, &st);
-    return (int)(st.st_size / sizeof(Loan)) + 1;
-}
-
-/* WAL helpers: append line to WAL (with simple locking) */
-int wal_append_line(const char *line) {
-    // Acquire exclusive lock for WAL file (threads/processes) using flock
-    if (flock(fd_wal, LOCK_EX) < 0) return -1;
-    ssize_t n = write(fd_wal, line, strlen(line));
-    write(fd_wal, "\n", 1);
-    fsync(fd_wal);   // ensure durability of WAL
-    flock(fd_wal, LOCK_UN);
-    return (n >= 0) ? 0 : -1;
-}
-
-/* WAL transaction: append BEGIN, actions..., COMMIT.
-   For simplicity each transaction will be a sequence of action lines; actions are applied during commit (we apply immediately in this implementation but still log before apply to ensure atomicity).
-*/
-
-/* Transaction ID generator (timestamp based) */
-void gen_txid(char *buf, size_t len) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    snprintf(buf, len, "TX%ld%ld", tv.tv_sec, tv.tv_usec);
-}
-
-/* Apply a simple action line of format:
-   DEBIT acc_no amount
-   CREDIT acc_no amount
-   UPDATE_LOAN loan_id status
-*/
-int apply_action_line(const char *line) {
-    char action[64];
-    int id;
-    double amount;
-    if (sscanf(line, "%63s", action) != 1) return -1;
-    if (strcmp(action, "DEBIT") == 0) {
-        if (sscanf(line, "DEBIT %d %lf", &id, &amount) == 2) {
-            Account acc;
-            if (read_account_by_no(id, &acc) != sizeof(Account)) return -1;
-            acc.balance -= amount;
-            if (acc.balance < -1e-9) return -2; // invalid: negative after op
-            write_account_by_no(id, &acc);
-            return 0;
-        }
-    } else if (strcmp(action, "CREDIT") == 0) {
-        if (sscanf(line, "CREDIT %d %lf", &id, &amount) == 2) {
-            Account acc;
-            if (read_account_by_no(id, &acc) != sizeof(Account)) return -1;
-            acc.balance += amount;
-            write_account_by_no(id, &acc);
-            return 0;
-        }
-    } else if (strcmp(action, "UPDATE_LOAN") == 0) {
-        int loan_id, status;
-        if (sscanf(line, "UPDATE_LOAN %d %d", &loan_id, &status) == 2) {
-            Loan loan;
-            if (read_loan_by_id(loan_id, &loan) != sizeof(Loan)) return -1;
-            loan.status = status;
-            write_loan_by_id(loan_id, &loan);
-            return 0;
+int find_account_by_username(const char *username, Account *acc) {
+    FILE *fp = fopen(DATA_FILE, "rb");
+    if (!fp) return 0;
+    while (fread(acc, sizeof(Account), 1, fp)) {
+        if (strcmp(acc->username, username) == 0) {
+            fclose(fp);
+            return 1;
         }
     }
-    return -1;
-}
-
-/* WAL-based atomic transfer: debit from 'from', credit 'to' */
-int tx_transfer(int from_acc, int to_acc, double amount) {
-    if (from_acc == to_acc) return -1;
-    // to avoid deadlocks, lock lower acc_no first
-    int a = (from_acc < to_acc) ? from_acc : to_acc;
-    int b = (from_acc < to_acc) ? to_acc : from_acc;
-
-    off_t off_a = (off_t)(a - 1) * sizeof(Account);
-    off_t off_b = (off_t)(b - 1) * sizeof(Account);
-    // Lock both records for write
-    if (lock_by_offset(fd_acc, off_a, sizeof(Account), F_WRLCK) < 0) return -1;
-    if (lock_by_offset(fd_acc, off_b, sizeof(Account), F_WRLCK) < 0) {
-        // unlock a
-        lock_by_offset(fd_acc, off_a, sizeof(Account), F_UNLCK);
-        return -1;
-    }
-
-    // Basic pre-checks
-    Account acc_from, acc_to;
-    if (read_account_by_no(from_acc, &acc_from) != sizeof(Account) ||
-        read_account_by_no(to_acc, &acc_to) != sizeof(Account)) {
-        lock_by_offset(fd_acc, off_a, sizeof(Account), F_UNLCK);
-        lock_by_offset(fd_acc, off_b, sizeof(Account), F_UNLCK);
-        return -1;
-    }
-    if (!acc_from.active || !acc_to.active) {
-        lock_by_offset(fd_acc, off_a, sizeof(Account), F_UNLCK);
-        lock_by_offset(fd_acc, off_b, sizeof(Account), F_UNLCK);
-        return -1;
-    }
-    if (acc_from.balance + 1e-9 < amount) {
-        // insufficient funds
-        lock_by_offset(fd_acc, off_a, sizeof(Account), F_UNLCK);
-        lock_by_offset(fd_acc, off_b, sizeof(Account), F_UNLCK);
-        return -2;
-    }
-
-    // WAL: create tx
-    char txid[64];
-    gen_txid(txid, sizeof(txid));
-    char buf[TX_BUF];
-
-    snprintf(buf, sizeof(buf), "BEGIN %s", txid);
-    wal_append_line(buf);
-
-    snprintf(buf, sizeof(buf), "DEBIT %d %.2f", from_acc, amount);
-    wal_append_line(buf);
-
-    snprintf(buf, sizeof(buf), "CREDIT %d %.2f", to_acc, amount);
-    wal_append_line(buf);
-
-    // COMMIT
-    snprintf(buf, sizeof(buf), "COMMIT %s", txid);
-    wal_append_line(buf);
-
-    // Apply: NOTE: here we apply after WAL ensures durability. In a production WAL/redo you'd apply before commit or use two-phase approach. For clarity we:
-    // Apply debit then credit (both already locked).
-    acc_from.balance -= amount;
-    acc_to.balance += amount;
-    write_account_by_no(from_acc, &acc_from);
-    write_account_by_no(to_acc, &acc_to);
-    fsync(fd_acc);
-
-    // unlock
-    lock_by_offset(fd_acc, off_a, sizeof(Account), F_UNLCK);
-    lock_by_offset(fd_acc, off_b, sizeof(Account), F_UNLCK);
+    fclose(fp);
     return 0;
 }
 
-/* Deposit or withdraw (single account TX) */
-int tx_deposit(int acc_no, double amount) {
-    off_t off = (off_t)(acc_no - 1) * sizeof(Account);
-    if (lock_by_offset(fd_acc, off, sizeof(Account), F_WRLCK) < 0) return -1;
-    Account acc;
-    if (read_account_by_no(acc_no, &acc) != sizeof(Account)) {
-        lock_by_offset(fd_acc, off, sizeof(Account), F_UNLCK);
-        return -1;
-    }
-    if (!acc.active) { lock_by_offset(fd_acc, off, sizeof(Account), F_UNLCK); return -1; }
+// Validate username, password, and role
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+#include "common.h"
 
-    char txid[64], buf[TX_BUF];
-    gen_txid(txid, sizeof(txid));
-    snprintf(buf, sizeof(buf), "BEGIN %s", txid); wal_append_line(buf);
-    snprintf(buf, sizeof(buf), "CREDIT %d %.2f", acc_no, amount); wal_append_line(buf);
-    snprintf(buf, sizeof(buf), "COMMIT %s", txid); wal_append_line(buf);
-
-    acc.balance += amount;
-    write_account_by_no(acc_no, &acc);
-    fsync(fd_acc);
-
-    lock_by_offset(fd_acc, off, sizeof(Account), F_UNLCK);
-    return 0;
-}
-int tx_withdraw(int acc_no, double amount) {
-    off_t off = (off_t)(acc_no - 1) * sizeof(Account);
-    if (lock_by_offset(fd_acc, off, sizeof(Account), F_WRLCK) < 0) return -1;
-    Account acc;
-    if (read_account_by_no(acc_no, &acc) != sizeof(Account)) {
-        lock_by_offset(fd_acc, off, sizeof(Account), F_UNLCK);
-        return -1;
-    }
-    if (!acc.active) { lock_by_offset(fd_acc, off, sizeof(Account), F_UNLCK); return -1; }
-    if (acc.balance + 1e-9 < amount) {
-        lock_by_offset(fd_acc, off, sizeof(Account), F_UNLCK);
-        return -2;
+bool check_credentials(const char *username, const char *password, const char *role, Account *acc) {
+    FILE *fp = fopen("accounts.db", "rb");
+    if (!fp) {
+        perror("Error opening accounts.db");
+        return false;
     }
 
-    char txid[64], buf[TX_BUF];
-    gen_txid(txid, sizeof(txid));
-    snprintf(buf, sizeof(buf), "BEGIN %s", txid); wal_append_line(buf);
-    snprintf(buf, sizeof(buf), "DEBIT %d %.2f", acc_no, amount); wal_append_line(buf);
-    snprintf(buf, sizeof(buf), "COMMIT %s", txid); wal_append_line(buf);
-
-    acc.balance -= amount;
-    write_account_by_no(acc_no, &acc);
-    fsync(fd_acc);
-
-    lock_by_offset(fd_acc, off, sizeof(Account), F_UNLCK);
-    return 0;
-}
-
-/* Simple loan application: creates loan record in loans.dat with LOAN_PENDING */
-int apply_loan(int acc_no, double amount, const char *purpose) {
-    int loan_id = next_loan_id();
-    Loan loan;
-    memset(&loan, 0, sizeof(Loan));
-    loan.loan_id = loan_id;
-    loan.acc_no = acc_no;
-    loan.amount = amount;
-    loan.status = LOAN_PENDING;
-    strncpy(loan.purpose, purpose, sizeof(loan.purpose)-1);
-    write_loan_by_id(loan_id, &loan);
-    return loan_id;
-}
-
-/* Manager approves/rejects: use WAL to record UPDATE_LOAN and apply */
-int update_loan_status(int loan_id, int new_status) {
-    // lock loan record for write
-    off_t off = (off_t)(loan_id - 1) * sizeof(Loan);
-    if (lock_by_offset(fd_loan, off, sizeof(Loan), F_WRLCK) < 0) return -1;
-    Loan loan;
-    if (read_loan_by_id(loan_id, &loan) != sizeof(Loan)) {
-        lock_by_offset(fd_loan, off, sizeof(Loan), F_UNLCK);
-        return -1;
-    }
-    // WAL entry
-    char txid[64], buf[TX_BUF];
-    gen_txid(txid, sizeof(txid));
-    snprintf(buf, sizeof(buf), "BEGIN %s", txid); wal_append_line(buf);
-    snprintf(buf, sizeof(buf), "UPDATE_LOAN %d %d", loan_id, new_status); wal_append_line(buf);
-    snprintf(buf, sizeof(buf), "COMMIT %s", txid); wal_append_line(buf);
-
-    loan.status = new_status;
-    write_loan_by_id(loan_id, &loan);
-    fsync(fd_loan);
-
-    lock_by_offset(fd_loan, off, sizeof(Loan), F_UNLCK);
-    return 0;
-}
-
-/* WAL recovery on startup: parse wal.log and apply committed transactions */
-void wal_recover_and_apply() {
-    // Simple implementation: read wal file, collect transactions between BEGIN/COMMIT, only apply if COMMIT exists.
-    lseek(fd_wal, 0, SEEK_SET);
-    FILE *f = fdopen(dup(fd_wal), "r");
-    if (!f) return;
-    char line[1024];
-    int in_tx = 0;
-    char txid[128] = {0};
-    // store actions temporarily in a dynamic list
-    char **actions = NULL;
-    size_t act_count = 0;
-
-    while (fgets(line, sizeof(line), f)) {
-        // strip newline
-        line[strcspn(line, "\r\n")] = 0;
-        if (strncmp(line, "BEGIN ", 6) == 0) {
-            in_tx = 1;
-            strncpy(txid, line + 6, sizeof(txid)-1);
-            // clear actions
-            for (size_t i=0;i<act_count;i++) free(actions[i]);
-            free(actions); actions = NULL; act_count = 0;
-        } else if (in_tx && strncmp(line, "COMMIT ", 7) == 0) {
-            // commit — apply actions
-            for (size_t i=0;i<act_count;i++) {
-                // apply action string
-                // for safety, try parsing and applying; ignore errors (basic)
-                apply_action_line(actions[i]);
-            }
-            in_tx = 0;
-            txid[0] = 0;
-            for (size_t i=0;i<act_count;i++) free(actions[i]);
-            free(actions); actions = NULL; act_count = 0;
-        } else {
-            // action line (DEBIT/CREDIT/UPDATE_LOAN)
-            if (in_tx) {
-                actions = realloc(actions, sizeof(char*) * (act_count+1));
-                actions[act_count] = strdup(line);
-                act_count++;
-            } else {
-                // stray action without BEGIN; ignore
-            }
+    Account a;
+    while (fread(&a, sizeof(Account), 1, fp) == 1) {
+        if (strcmp(a.username, username) == 0 &&
+            strcmp(a.password, password) == 0 &&
+            strcmp(a.role, role) == 0) {
+            *acc = a;
+            fclose(fp);
+            return true;
         }
     }
-    // cleanup
-    for (size_t i=0;i<act_count;i++) free(actions[i]);
-    free(actions);
-    fclose(f);
 
-    // Optionally truncate WAL after recovery (for demo we keep it)
+    fclose(fp);
+    return false;
 }
 
-/* Networking & protocol:
-   Simple text protocol. Client logs in by sending:
-   ROLE <role> (role: CUSTOMER/EMPLOYEE/MANAGER/ADMIN)
-   AUTH <acc_no> <password>
-   Then server will respond "OK" or "ERR ..." and then command loop.
-   Commands vary by role, e.g.:
-   CUSTOMER: DEPOSIT amount | WITHDRAW amount | TRANSFER to_acc amount | APPLY_LOAN amount purpose | VIEW | LOGOUT
-   EMPLOYEE: LIST_PENDING_LOANS | MARK_REVIEW loan_id | LOGOUT
-   MANAGER: LIST_REVIEWED | APPROVE loan_id | REJECT loan_id | LOGOUT
-   ADMIN: CREATE_ACCOUNT name password balance role | DELETE_ACCOUNT acc_no | LIST_ACCOUNTS | LOGOUT
-*/
 
-/* Utility read/write line (socket) */
-ssize_t sock_readline(int fd, char *buf, size_t max) {
-    ssize_t total = 0;
-    while (total < (ssize_t)max-1) {
-        char c;
-        ssize_t n = read(fd, &c, 1);
-        if (n <= 0) return (total>0)? total : n;
-        if (c == '\n') break;
-        buf[total++] = c;
+void *client_handler(void *arg);
+
+int main() {
+    int server_fd, client_fd;
+    struct sockaddr_in address;
+    socklen_t addrlen = sizeof(address);
+
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == -1) { perror("socket"); exit(1); }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("bind"); exit(1);
     }
-    buf[total] = 0;
-    return total;
-}
-ssize_t sock_writeline(int fd, const char *s) {
-    size_t len = strlen(s);
-    ssize_t n = write(fd, s, len);
-    write(fd, "\n", 1);
-    return n;
+
+    if (listen(server_fd, 10) < 0) {
+        perror("listen"); exit(1);
+    }
+
+    printf("Server started on port %d...\n", PORT);
+
+    while (1) {
+        client_fd = accept(server_fd, (struct sockaddr *)&address, &addrlen);
+        if (client_fd < 0) { perror("accept"); continue; }
+
+        pthread_t tid;
+        pthread_create(&tid, NULL, client_handler, (void *)(intptr_t)client_fd);
+        pthread_detach(tid);
+    }
+    close(server_fd);
+    return 0;
 }
 
-/* Simple trim of whitespace */
-void trim(char *s) {
-    size_t i = strlen(s);
-    while (i>0 && (s[i-1]=='\n' || s[i-1]=='\r' || s[i-1]==' ' || s[i-1]=='\t')) { s[i-1]=0; i--; }
-}
-
-/* Handler for an authenticated client */
-void handle_client_session(int client_fd, int role, int acc_no) {
+void *client_handler(void *arg) {
+    int sock = (intptr_t)arg;
     char buf[1024];
-    char reply[1024];
+    Account acc;
+    char username[50], password[50], role[20];
 
-    if (role == ROLE_CUSTOMER) {
-        sock_writeline(client_fd, "Welcome, CUSTOMER. Commands: DEPOSIT amt | WITHDRAW amt | TRANSFER to amt | APPLY_LOAN amt purpose | VIEW | LOGOUT");
-        while (1) {
-            ssize_t n = sock_readline(client_fd, buf, sizeof(buf));
-            if (n <= 0) break;
-            trim(buf);
-            if (strcasecmp(buf, "LOGOUT")==0) break;
-            if (strncasecmp(buf, "DEPOSIT ", 8)==0) {
-                double amt = atof(buf+8);
-                int r = tx_deposit(acc_no, amt);
-                if (r==0) sock_writeline(client_fd, "Deposit OK");
-                else sock_writeline(client_fd, "Deposit Failed");
-            } else if (strncasecmp(buf, "WITHDRAW ", 9)==0) {
-                double amt = atof(buf+9);
-                int r = tx_withdraw(acc_no, amt);
-                if (r==0) sock_writeline(client_fd, "Withdraw OK");
-                else if (r==-2) sock_writeline(client_fd, "Insufficient funds");
-                else sock_writeline(client_fd, "Withdraw Failed");
-            } else if (strncasecmp(buf, "TRANSFER ", 9)==0) {
-                int to; double amt;
-                if (sscanf(buf+9, "%d %lf", &to, &amt) == 2) {
-                    int r = tx_transfer(acc_no, to, amt);
-                    if (r==0) sock_writeline(client_fd, "Transfer OK");
-                    else if (r==-2) sock_writeline(client_fd, "Insufficient funds or invalid");
-                    else sock_writeline(client_fd, "Transfer Failed");
-                } else sock_writeline(client_fd, "Bad format: TRANSFER to_acc amount");
-            } else if (strncasecmp(buf, "APPLY_LOAN ", 11)==0) {
-                double amt; char purpose[128];
-                // expectation: APPLY_LOAN <amt> <purpose...>
-                char *p = buf + 11;
-                if (sscanf(p, "%lf", &amt) >= 1) {
-                    // find first space after amount
-                    char *space = strchr(p, ' ');
-                    if (space) {
-                        strncpy(purpose, space+1, sizeof(purpose)-1);
-                    } else strcpy(purpose, "General");
-                    int loan_id = apply_loan(acc_no, amt, purpose);
-                    snprintf(reply, sizeof(reply), "Loan Applied. LoanID=%d", loan_id);
-                    sock_writeline(client_fd, reply);
-                } else sock_writeline(client_fd, "Bad format: APPLY_LOAN amount purpose");
-            } else if (strcasecmp(buf, "VIEW")==0) {
-                Account a;
-                if (read_account_by_no(acc_no, &a) == sizeof(Account)) {
-                    snprintf(reply, sizeof(reply), "Acc %d: Name=%s Balance=%.2f Active=%d", a.acc_no, a.name, a.balance, a.active);
-                    sock_writeline(client_fd, reply);
-                } else sock_writeline(client_fd, "Error reading account");
-            } else sock_writeline(client_fd, "Unknown command");
-        } // end while
-    } else if (role == ROLE_EMPLOYEE) {
-        // list pending loans
-        sock_writeline(client_fd, "EMPLOYEE: Commands: LIST_PENDING | MARK_REVIEW loan_id | LOGOUT");
-        while (1) {
-            ssize_t n = sock_readline(client_fd, buf, sizeof(buf));
-            if (n<=0) break;
-            trim(buf);
-            if (strcasecmp(buf, "LOGOUT")==0) break;
-            if (strcasecmp(buf, "LIST_PENDING")==0) {
-                // scan loans.dat
-                struct stat st; fstat(fd_loan, &st);
-                int cnt = st.st_size / sizeof(Loan);
-                for (int i=1;i<=cnt;i++) {
-                    Loan loan; if (read_loan_by_id(i, &loan) == sizeof(Loan)) {
-                        if (loan.status == LOAN_PENDING) {
-                            snprintf(reply, sizeof(reply), "LoanID=%d Acc=%d Amt=%.2f Purpose=%s", loan.loan_id, loan.acc_no, loan.amount, loan.purpose);
-                            sock_writeline(client_fd, reply);
-                        }
-                    }
-                }
-                sock_writeline(client_fd, "END_LIST");
-            } else if (strncasecmp(buf, "MARK_REVIEW ", 12)==0) {
-                int lid = atoi(buf+12);
-                // mark reviewed
-                int r = update_loan_status(lid, LOAN_REVIEWED);
-                if (r==0) sock_writeline(client_fd, "Marked REVIEWED");
-                else sock_writeline(client_fd, "Failed to mark review");
-            } else sock_writeline(client_fd, "Unknown command");
-        }
-    } else if (role == ROLE_MANAGER) {
-        sock_writeline(client_fd, "MANAGER: Commands: LIST_REVIEWED | APPROVE loan_id | REJECT loan_id | LOGOUT");
-        while (1) {
-            ssize_t n = sock_readline(client_fd, buf, sizeof(buf));
-            if (n<=0) break;
-            trim(buf);
-            if (strcasecmp(buf, "LOGOUT")==0) break;
-            if (strcasecmp(buf, "LIST_REVIEWED")==0) {
-                struct stat st; fstat(fd_loan, &st);
-                int cnt = st.st_size / sizeof(Loan);
-                for (int i=1;i<=cnt;i++) {
-                    Loan loan; if (read_loan_by_id(i, &loan) == sizeof(Loan)) {
-                        if (loan.status == LOAN_REVIEWED) {
-                            snprintf(reply, sizeof(reply), "LoanID=%d Acc=%d Amt=%.2f Purpose=%s", loan.loan_id, loan.acc_no, loan.amount, loan.purpose);
-                            sock_writeline(client_fd, reply);
-                        }
-                    }
-                }
-                sock_writeline(client_fd, "END_LIST");
-            } else if (strncasecmp(buf, "APPROVE ", 8)==0) {
-                int lid = atoi(buf+8);
-                int r = update_loan_status(lid, LOAN_APPROVED);
-                if (r==0) sock_writeline(client_fd, "Approved");
-                else sock_writeline(client_fd, "Failed to approve");
-            } else if (strncasecmp(buf, "REJECT ", 7)==0) {
-                int lid = atoi(buf+7);
-                int r = update_loan_status(lid, LOAN_REJECTED);
-                if (r==0) sock_writeline(client_fd, "Rejected");
-                else sock_writeline(client_fd, "Failed to reject");
-            } else sock_writeline(client_fd, "Unknown command");
-        }
-    } else if (role == ROLE_ADMIN) {
-        sock_writeline(client_fd, "ADMIN: Commands: CREATE_ACCOUNT name pwd bal role | DELETE_ACCOUNT acc_no | LIST_ACCOUNTS | LOGOUT");
-        while (1) {
-            ssize_t n = sock_readline(client_fd, buf, sizeof(buf));
-            if (n<=0) break;
-            trim(buf);
-            if (strcasecmp(buf, "LOGOUT")==0) break;
-            if (strncasecmp(buf, "CREATE_ACCOUNT ", 15)==0) {
-                // format: CREATE_ACCOUNT name pwd balance rolenum
-                char name[MAX_NAME], pwd[MAX_PASS];
-                double bal; int rolenum;
-                // naive parse:
-                char *p = buf + 15;
-                if (sscanf(p, "%63s %31s %lf %d", name, pwd, &bal, &rolenum) == 4) {
-                    int accno = next_account_no();
-                    Account a; memset(&a,0,sizeof(Account));
-                    a.acc_no = accno; a.role = rolenum; strncpy(a.name, name, sizeof(a.name)-1);
-                    strncpy(a.password, pwd, sizeof(a.password)-1); a.balance = bal; a.active = 1;
-                    write_account_by_no(accno, &a);
-                    snprintf(reply, sizeof(reply), "Created account %d", accno);
-                    sock_writeline(client_fd, reply);
-                } else sock_writeline(client_fd, "Bad format: CREATE_ACCOUNT name pwd balance role");
-            } else if (strncasecmp(buf, "DELETE_ACCOUNT ", 15)==0) {
-                int accdel = atoi(buf+15);
-                Account a;
-                if (read_account_by_no(accdel, &a) == sizeof(Account)) {
-                    a.active = 0; write_account_by_no(accdel, &a);
-                    sock_writeline(client_fd, "Deleted (marked inactive)");
-                } else sock_writeline(client_fd, "Account not found");
-            } else if (strcasecmp(buf, "LIST_ACCOUNTS")==0) {
-                struct stat st; fstat(fd_acc, &st);
-                int cnt = st.st_size / sizeof(Account);
-                for (int i=1;i<=cnt;i++) {
-                    Account a; if (read_account_by_no(i, &a) == sizeof(Account)) {
-                        snprintf(reply, sizeof(reply), "Acc=%d Name=%s Role=%d Bal=%.2f Active=%d", a.acc_no, a.name, a.role, a.balance, a.active);
-                        sock_writeline(client_fd, reply);
-                    }
-                }
-                sock_writeline(client_fd, "END_LIST");
-            } else sock_writeline(client_fd, "Unknown command");
-        }
+    // --- Step 1: Ask for role selection first ---
+    const char *role_menu =
+        "Select role:\n"
+        "1. CUSTOMER\n"
+        "2. EMPLOYEE\n"
+        "3. MANAGER\n"
+        "4. ADMIN\n"
+        "Enter choice:\n";
+    send_msg(sock, role_menu);
+
+    int n = read(sock, buf, sizeof(buf) - 1);
+    if (n <= 0) { close(sock); return NULL; }
+    buf[n] = '\0';
+    int choice = atoi(buf);
+
+    switch (choice) {
+        case 1: strcpy(role, "CUSTOMER"); break;
+        case 2: strcpy(role, "EMPLOYEE"); break;
+        case 3: strcpy(role, "MANAGER"); break;
+        case 4: strcpy(role, "ADMIN"); break;
+        default:
+            send_msg(sock, "Invalid role choice. Connection closing.\n");
+            close(sock);
+            return NULL;
     }
-    sock_writeline(client_fd, "BYE");
+
+    // --- Step 2: Ask username and password ---
+    send_msg(sock, "Enter username:\n");
+    n = read(sock, buf, sizeof(buf) - 1);
+    if (n <= 0) { close(sock); return NULL; }
+    buf[n] = '\0';
+    buf[strcspn(buf, "\r\n")] = 0;
+    strcpy(username, buf);
+
+    send_msg(sock, "Enter password:\n");
+    n = read(sock, buf, sizeof(buf) - 1);
+    if (n <= 0) { close(sock); return NULL; }
+    buf[n] = '\0';
+    buf[strcspn(buf, "\r\n")] = 0;
+    strcpy(password, buf);
+
+    // --- Step 3: Verify credentials ---
+    if (!check_credentials(username, password, role, &acc)) {
+        send_msg(sock, "Invalid credentials or role.\nConnection closed.\n");
+        close(sock);
+        return NULL;
+    }
+
+    // --- Step 4: Login success ---
+    send_msg(sock, "Login successful!\n");
+    char role_msg[64];
+    sprintf(role_msg, "ROLE:%s\n", acc.role);
+    send_msg(sock, role_msg);
+
+    // --- Step 5: Role-specific handler ---
+    if (strcmp(acc.role, "CUSTOMER") == 0) {
+    send_msg(sock, "MENU\n");
+    handle_customer(sock, &acc);
+} else if (strcmp(acc.role, "EMPLOYEE") == 0) {
+    send_msg(sock, "MENU\n");
+    handle_employee(sock, &acc);
+} else if (strcmp(acc.role, "MANAGER") == 0) {
+    send_msg(sock, "MENU\n");
+    handle_manager(sock, &acc);
+} else if (strcmp(acc.role, "ADMIN") == 0) {
+    send_msg(sock, "MENU\n");
+    handle_admin(sock, &acc);
 }
 
-/* Authentication flow: simple. Client first sends e.g.:
-   LOGIN <role> <acc_no> <password>
-   role string: CUSTOMER / EMPLOYEE / MANAGER / ADMIN
-*/
-int parse_role_str(const char *s) {
-    if (strcasecmp(s, "CUSTOMER")==0) return ROLE_CUSTOMER;
-    if (strcasecmp(s, "EMPLOYEE")==0) return ROLE_EMPLOYEE;
-    if (strcasecmp(s, "MANAGER")==0)  return ROLE_MANAGER;
-    if (strcasecmp(s, "ADMIN")==0)    return ROLE_ADMIN;
-    return -1;
-}
 
-/* Thread: accept client socket and handle login + session */
-void *client_thread(void *arg) {
-    int client_fd = *(int*)arg; free(arg);
-    char buf[1024];
-    // prompt
-    sock_writeline(client_fd, "BANK_SERVER: Send LOGIN <ROLE> <acc_no> <password>");
-    ssize_t n = sock_readline(client_fd, buf, sizeof(buf));
-    if (n <= 0) { close(client_fd); return NULL; }
-    trim(buf);
-    // parse
-    char cmd[16], role_s[32], pass[64];
-    int acc_no = -1;
-    if (sscanf(buf, "%15s %31s %d %63s", cmd, role_s, &acc_no, pass) != 4) {
-        sock_writeline(client_fd, "ERR bad login format");
-        close(client_fd); return NULL;
-    }
-    if (strcasecmp(cmd, "LOGIN") != 0) {
-        sock_writeline(client_fd, "ERR expected LOGIN");
-        close(client_fd); return NULL;
-    }
-    int role = parse_role_str(role_s);
-    if (role < 0) { sock_writeline(client_fd, "ERR unknown role"); close(client_fd); return NULL; }
-
-    if (role == ROLE_ADMIN) {
-        if (strcmp(pass, ADMIN_PASS) == 0) {
-            sock_writeline(client_fd, "OK admin");
-            handle_client_session(client_fd, ROLE_ADMIN, 0);
-        } else {
-            sock_writeline(client_fd, "ERR admin auth");
-        }
-    } else {
-        // validate user from accounts.dat
-        Account acc;
-        if (acc_no <= 0) { sock_writeline(client_fd, "ERR invalid account"); close(client_fd); return NULL; }
-        if (read_account_by_no(acc_no, &acc) != sizeof(Account)) {
-            sock_writeline(client_fd, "ERR no such account"); close(client_fd); return NULL;
-        }
-        if (!acc.active) { sock_writeline(client_fd, "ERR inactive account"); close(client_fd); return NULL; }
-        if (strcmp(acc.password, pass) != 0) {
-            sock_writeline(client_fd, "ERR bad password"); close(client_fd); return NULL;
-        }
-        // check role matches (employee/manager/customer)
-        if (acc.role != role) {
-            // allow some flexibility: a manager account may be used by admin, etc. For demo we enforce equal.
-            sock_writeline(client_fd, "ERR role mismatch");
-            close(client_fd); return NULL;
-        }
-        sock_writeline(client_fd, "OK auth");
-        handle_client_session(client_fd, role, acc_no);
-    }
-
-    close(client_fd);
+    close(sock);
     return NULL;
 }
 
-/* Server main */
-int main() {
-    ensure_files();
-    wal_recover_and_apply(); // recover before serving
 
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) { perror("socket"); exit(1); }
-    int opt = 1; setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in srv; memset(&srv, 0, sizeof(srv));
-    srv.sin_family = AF_INET; srv.sin_addr.s_addr = INADDR_ANY; srv.sin_port = htons(PORT);
 
-    if (bind(listen_fd, (struct sockaddr*)&srv, sizeof(srv)) < 0) { perror("bind"); exit(1); }
-    if (listen(listen_fd, BACKLOG) < 0) { perror("listen"); exit(1); }
+// ---------------- CUSTOMER ROLE ----------------
 
-    printf("Server listening on port %d\n", PORT);
+void update_account(Account *acc) {
+    pthread_mutex_lock(&file_mutex);
+    FILE *fp = fopen(DATA_FILE, "r+b");
+    if (!fp) { pthread_mutex_unlock(&file_mutex); return; }
+    Account tmp;
+    while (fread(&tmp, sizeof(Account), 1, fp)) {
+        if (tmp.id == acc->id) {
+            fseek(fp, -sizeof(Account), SEEK_CUR);
+            fwrite(acc, sizeof(Account), 1, fp);
+            fflush(fp);
+            break;
+        }
+    }
+    fclose(fp);
+    pthread_mutex_unlock(&file_mutex);
+}
+
+void handle_customer(int sock, Account *acc) {
+    char buf[1024];
+    while (1) {
+        ssize_t n = read(sock, buf, sizeof(buf) - 1);
+        if (n <= 0) break;
+        buf[n] = 0;
+        buf[strcspn(buf, "\r\n")] = 0;
+
+        if (strcmp(buf, "DEPOSIT") == 0) {
+            read(sock, buf, sizeof(buf));
+            float amt = atof(buf);
+            int fd = open(DATA_FILE, O_RDWR);
+            flock(fd, LOCK_EX);             // write lock
+            acc->balance += amt;
+            update_account(acc);
+            flock(fd, LOCK_UN);
+            close(fd);
+            send_msg(sock, "Deposit successful.");
+        }
+
+        else if (strcmp(buf, "WITHDRAW") == 0) {
+            read(sock, buf, sizeof(buf));
+            float amt = atof(buf);
+            int fd = open(DATA_FILE, O_RDWR);
+            flock(fd, LOCK_EX);
+            if (acc->balance >= amt) {
+                acc->balance -= amt;
+                update_account(acc);
+                send_msg(sock, "Withdrawal successful.");
+            } else {
+                send_msg(sock, "Insufficient balance.");
+            }
+            flock(fd, LOCK_UN);
+            close(fd);
+        }
+
+        else if (strcmp(buf, "BALANCE") == 0) {
+            char msg[100];
+            snprintf(msg, sizeof(msg), "Current Balance: ₹%.2f", acc->balance);
+            send_msg(sock, msg);
+        }
+
+        else if (strcmp(buf, "APPLY_LOAN") == 0) {
+            if (acc->loan_pending == 0) {
+                acc->loan_pending = 1;
+                update_account(acc);
+                send_msg(sock, "Loan request submitted for review.");
+            } else {
+                send_msg(sock, "Loan already pending or approved.");
+            }
+        }
+
+        else if (strcmp(buf, "VIEW") == 0) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "Account ID: %d\nUsername: %s\nBalance: ₹%.2f\nLoan Status: %s",
+                     acc->id, acc->username, acc->balance,
+                     acc->loan_pending == 0 ? "None" :
+                     acc->loan_pending == 1 ? "Pending" : "Approved");
+            send_msg(sock, msg);
+        }
+
+        else if (strcmp(buf, "LOGOUT") == 0) {
+            send_msg(sock, "Logging out...");
+            break;
+        }
+
+        else {
+            send_msg(sock, "Invalid customer command.");
+        }
+    }
+}
+
+// Find account by numeric id (returns 1 if found and fills acc_out, 0 otherwise)
+int find_account_by_id(int id, Account *acc_out) {
+    pthread_mutex_lock(&file_mutex);
+    FILE *fp = fopen(DATA_FILE, "rb");
+    if (!fp) { pthread_mutex_unlock(&file_mutex); return 0; }
+    Account tmp;
+    int found = 0;
+    while (fread(&tmp, sizeof(Account), 1, fp) == 1) {
+        if (tmp.id == id) {
+            if (acc_out) *acc_out = tmp;
+            found = 1;
+            break;
+        }
+    }
+    fclose(fp);
+    pthread_mutex_unlock(&file_mutex);
+    return found;
+}
+
+// Credit an account by id (uses file lock and update_account)
+int credit_account_by_id(int id, double amount) {
+    // load account, lock and update
+    pthread_mutex_lock(&file_mutex);
+    FILE *fp = fopen(DATA_FILE, "r+b");
+    if (!fp) { pthread_mutex_unlock(&file_mutex); return -1; }
+    Account tmp;
+    int success = 0;
+    while (fread(&tmp, sizeof(Account), 1, fp) == 1) {
+        if (tmp.id == id) {
+            // Move back and update
+            tmp.balance += amount;
+            fseek(fp, -sizeof(Account), SEEK_CUR);
+            fwrite(&tmp, sizeof(Account), 1, fp);
+            fflush(fp);
+            success = 1;
+            break;
+        }
+    }
+    fclose(fp);
+    pthread_mutex_unlock(&file_mutex);
+    return success ? 0 : -1;
+}
+
+
+// ---------------- EMPLOYEE ROLE ----------------
+void handle_employee(int sock, Account *self) {
+    // self is the employee account object (not used heavily here)
+    char buf[1024];
+    while (1) {
+        ssize_t n = read(sock, buf, sizeof(buf) - 1);
+        if (n <= 0) break;
+        buf[n] = 0;
+        buf[strcspn(buf, "\r\n")] = 0;
+
+        // Commands expected from client (menu-driven client can send):
+        // "VIEW_PENDING"      -> list accounts with loan_pending == 1
+        // "MARK_REVIEW"       -> next line: account id to mark as reviewed (set loan_pending=2)
+        // "VIEW_ACCOUNT"      -> next line: account id to display
+        // "LOGOUT"
+
+        if (strcmp(buf, "VIEW_PENDING") == 0) {
+            pthread_mutex_lock(&file_mutex);
+            FILE *fp = fopen(DATA_FILE, "rb");
+            if (!fp) {
+                pthread_mutex_unlock(&file_mutex);
+                send_msg(sock, "Failed to open accounts file.");
+                continue;
+            }
+            Account tmp;
+            int any = 0;
+            while (fread(&tmp, sizeof(Account), 1, fp) == 1) {
+                if (tmp.loan_pending == 1) {
+                    char out[256];
+                    snprintf(out, sizeof(out), "AccID=%d Name=%s Balance=%.2f", tmp.id, tmp.username, tmp.balance);
+                    send_msg(sock, out);
+                    any = 1;
+                }
+            }
+            fclose(fp);
+            pthread_mutex_unlock(&file_mutex);
+            if (!any) send_msg(sock, "No pending loans found.");
+        }
+        else if (strcmp(buf, "MARK_REVIEW") == 0) {
+            // expect account id on next line
+            if (read(sock, buf, sizeof(buf)) <= 0) break;
+            buf[strcspn(buf, "\r\n")] = 0;
+            int id = atoi(buf);
+            Account target;
+            if (!find_account_by_id(id, &target)) {
+                send_msg(sock, "Account not found.");
+                continue;
+            }
+            // lock file and update target.loan_pending -> 2 (reviewed)
+            pthread_mutex_lock(&file_mutex);
+            FILE *fp = fopen(DATA_FILE, "r+b");
+            if (!fp) { pthread_mutex_unlock(&file_mutex); send_msg(sock, "Failed to open file."); continue; }
+            Account tmp;
+            int done = 0;
+            while (fread(&tmp, sizeof(Account), 1, fp) == 1) {
+                if (tmp.id == id) {
+                    tmp.loan_pending = 2; // reviewed
+                    fseek(fp, -sizeof(Account), SEEK_CUR);
+                    fwrite(&tmp, sizeof(Account), 1, fp);
+                    fflush(fp);
+                    done = 1;
+                    break;
+                }
+            }
+            fclose(fp);
+            pthread_mutex_unlock(&file_mutex);
+            if (done) send_msg(sock, "Marked loan as REVIEWED (forwarded to manager).");
+            else send_msg(sock, "Failed to update account.");
+        }
+        else if (strcmp(buf, "VIEW_ACCOUNT") == 0) {
+            // expect account id on next line
+            if (read(sock, buf, sizeof(buf)) <= 0) break;
+            buf[strcspn(buf, "\r\n")] = 0;
+            int id = atoi(buf);
+            Account t;
+            if (!find_account_by_id(id, &t)) {
+                send_msg(sock, "Account not found.");
+            } else {
+                char out[512];
+                snprintf(out, sizeof(out), "AccID=%d Name=%s Role=%s Balance=%.2f LoanStatus=%d",
+                         t.id, t.username, t.role, t.balance, t.loan_pending);
+                send_msg(sock, out);
+            }
+        }
+        else if (strcmp(buf, "LOGOUT") == 0) {
+            send_msg(sock, "Logging out.");
+            break;
+        }
+        else {
+            send_msg(sock, "Unknown employee command.");
+        }
+    } // end while
+}
+
+
+// ---------------- MANAGER ROLE ----------------
+void handle_manager(int sock, Account *self) {
+    char buf[1024];
+    while (1) {
+        ssize_t n = read(sock, buf, sizeof(buf) - 1);
+        if (n <= 0) break;
+        buf[n] = 0;
+        buf[strcspn(buf, "\r\n")] = 0;
+
+        // Commands:
+        // "LIST_REVIEWED"  -> list accounts with loan_pending == 2
+        // "APPROVE"        -> next line: account id to approve (set loan_pending=3 and credit amount)
+        // "REJECT"         -> next line: account id to reject (set loan_pending=4)
+        // "LOGOUT"
+
+        if (strcmp(buf, "LIST_REVIEWED") == 0) {
+            pthread_mutex_lock(&file_mutex);
+            FILE *fp = fopen(DATA_FILE, "rb");
+            if (!fp) { pthread_mutex_unlock(&file_mutex); send_msg(sock, "Failed to open file."); continue; }
+            Account tmp; int any = 0;
+            while (fread(&tmp, sizeof(Account), 1, fp) == 1) {
+                if (tmp.loan_pending == 2) {
+                    char out[256];
+                    snprintf(out, sizeof(out), "AccID=%d Name=%s Balance=%.2f", tmp.id, tmp.username, tmp.balance);
+                    send_msg(sock, out); any = 1;
+                }
+            }
+            fclose(fp);
+            pthread_mutex_unlock(&file_mutex);
+            if (!any) send_msg(sock, "No reviewed loans found.");
+        }
+        else if (strcmp(buf, "APPROVE") == 0) {
+            if (read(sock, buf, sizeof(buf)) <= 0) break;
+            buf[strcspn(buf, "\r\n")] = 0;
+            int id = atoi(buf);
+            Account t;
+            if (!find_account_by_id(id, &t)) { send_msg(sock, "Account not found."); continue; }
+            // For demo we don't have loan amount stored; assume a fixed loan amount or
+            // use e.g. a separate 'requested_amount' in account — but since we used acc->loan_pending only,
+            // we'll credit a demo amount, e.g., 1000.0 (you can change to real amount if stored).
+            double credit_amt = 1000.0;
+
+            // update account: set loan_pending=3 (approved) and credit amount
+            pthread_mutex_lock(&file_mutex);
+            FILE *fp = fopen(DATA_FILE, "r+b");
+            if (!fp) { pthread_mutex_unlock(&file_mutex); send_msg(sock, "Failed to open file."); continue; }
+            Account tmp; int done = 0;
+            while (fread(&tmp, sizeof(Account), 1, fp) == 1) {
+                if (tmp.id == id) {
+                    tmp.loan_pending = 3;
+                    tmp.balance += credit_amt;
+                    fseek(fp, -sizeof(Account), SEEK_CUR);
+                    fwrite(&tmp, sizeof(Account), 1, fp);
+                    fflush(fp);
+                    done = 1;
+                    break;
+                }
+            }
+            fclose(fp);
+            pthread_mutex_unlock(&file_mutex);
+            if (done) {
+                char out[128]; snprintf(out, sizeof(out), "Loan approved and ₹%.2f credited to account %d", credit_amt, id);
+                send_msg(sock, out);
+            } else send_msg(sock, "Failed to approve loan.");
+        }
+        else if (strcmp(buf, "REJECT") == 0) {
+            if (read(sock, buf, sizeof(buf)) <= 0) break;
+            buf[strcspn(buf, "\r\n")] = 0;
+            int id = atoi(buf);
+            pthread_mutex_lock(&file_mutex);
+            FILE *fp = fopen(DATA_FILE, "r+b");
+            if (!fp) { pthread_mutex_unlock(&file_mutex); send_msg(sock, "Failed to open file."); continue; }
+            Account tmp; int done = 0;
+            while (fread(&tmp, sizeof(Account), 1, fp) == 1) {
+                if (tmp.id == id) {
+                    tmp.loan_pending = 4; // rejected
+                    fseek(fp, -sizeof(Account), SEEK_CUR);
+                    fwrite(&tmp, sizeof(Account), 1, fp);
+                    fflush(fp);
+                    done = 1; break;
+                }
+            }
+            fclose(fp);
+            pthread_mutex_unlock(&file_mutex);
+            if (done) send_msg(sock, "Loan rejected.");
+            else send_msg(sock, "Failed to reject loan.");
+        }
+        else if (strcmp(buf, "LOGOUT") == 0) {
+            send_msg(sock, "Logging out.");
+            break;
+        }
+        else send_msg(sock, "Unknown manager command.");
+    }
+}
+
+
+
+// ---------------- ADMINISTRATOR ROLE ----------------
+
+void handle_admin(int sock, Account *acc) {
+    char buf[1024];
+
+    //  Send the admin menu when login is successful
+    send_msg(sock,
+        "ROLE:ADMIN\n"
+        "MENU:\n"
+        "1. ADD_ACCOUNT\n"
+        "2. DELETE_ACCOUNT\n"
+        "3. MODIFY_ACCOUNT\n"
+        "4. SEARCH_ACCOUNT\n"
+        "5. VIEW_ALL\n"
+        "6. LOGOUT\n"
+        "Enter your command (e.g., ADD_ACCOUNT):"
+    );
 
     while (1) {
-        struct sockaddr_in cli; socklen_t len = sizeof(cli);
-        int *client_fd = malloc(sizeof(int));
-        *client_fd = accept(listen_fd, (struct sockaddr*)&cli, &len);
-        if (*client_fd < 0) { free(client_fd); continue; }
-        pthread_t tid; pthread_create(&tid, NULL, client_thread, client_fd);
-        pthread_detach(tid);
-    }
+        ssize_t n = read(sock, buf, sizeof(buf) - 1);
+        if (n <= 0) break;
+        buf[n] = 0;
+        buf[strcspn(buf, "\r\n")] = 0;
 
-    close(fd_acc); close(fd_loan); close(fd_wal); close(listen_fd);
-    return 0;
+        if (strcmp(buf, "ADD_ACCOUNT") == 0) {
+            Account newAcc;
+            send_msg(sock, "Enter ID:");
+            read(sock, buf, sizeof(buf)); newAcc.id = atoi(buf);
+
+            send_msg(sock, "Enter Username:");
+            read(sock, newAcc.username, sizeof(newAcc.username));
+            newAcc.username[strcspn(newAcc.username, "\r\n")] = 0;
+
+            send_msg(sock, "Enter Password:");
+            read(sock, newAcc.password, sizeof(newAcc.password));
+            newAcc.password[strcspn(newAcc.password, "\r\n")] = 0;
+
+            send_msg(sock, "Enter Role (CUSTOMER/EMPLOYEE/MANAGER):");
+            read(sock, newAcc.role, sizeof(newAcc.role));
+            newAcc.role[strcspn(newAcc.role, "\r\n")] = 0;
+
+            newAcc.balance = 0;
+            newAcc.loan_pending = 0;
+
+            pthread_mutex_lock(&file_mutex);
+            FILE *fp = fopen(DATA_FILE, "ab");
+            fwrite(&newAcc, sizeof(Account), 1, fp);
+            fclose(fp);
+            pthread_mutex_unlock(&file_mutex);
+
+            send_msg(sock, "Account added successfully.");
+        }
+
+        else if (strcmp(buf, "DELETE_ACCOUNT") == 0) {
+            send_msg(sock, "Enter Account ID to delete:");
+            read(sock, buf, sizeof(buf));
+            int delId = atoi(buf);
+
+            pthread_mutex_lock(&file_mutex);
+            FILE *fp = fopen(DATA_FILE, "rb");
+            FILE *temp = fopen("temp.dat", "wb");
+            Account tmp; int found = 0;
+            while (fread(&tmp, sizeof(Account), 1, fp)) {
+                if (tmp.id == delId) found = 1;
+                else fwrite(&tmp, sizeof(tmp), 1, temp);
+            }
+            fclose(fp); fclose(temp);
+            remove(DATA_FILE); rename("temp.dat", DATA_FILE);
+            pthread_mutex_unlock(&file_mutex);
+
+            send_msg(sock, found ? "Account deleted." : "Account not found.");
+        }
+
+        else if (strcmp(buf, "MODIFY_ACCOUNT") == 0) {
+            send_msg(sock, "Enter Account ID to modify:");
+            read(sock, buf, sizeof(buf));
+            int id = atoi(buf);
+
+            pthread_mutex_lock(&file_mutex);
+            FILE *fp = fopen(DATA_FILE, "r+b");
+            Account tmp; int found = 0;
+            while (fread(&tmp, sizeof(Account), 1, fp)) {
+                if (tmp.id == id) {
+                    found = 1;
+                    send_msg(sock, "Enter new password:");
+                    read(sock, tmp.password, sizeof(tmp.password));
+                    tmp.password[strcspn(tmp.password, "\r\n")] = 0;
+                    fseek(fp, -sizeof(Account), SEEK_CUR);
+                    fwrite(&tmp, sizeof(Account), 1, fp);
+                    break;
+                }
+            }
+            fclose(fp);
+            pthread_mutex_unlock(&file_mutex);
+
+            send_msg(sock, found ? "Account updated." : "Account not found.");
+        }
+
+        else if (strcmp(buf, "SEARCH_ACCOUNT") == 0) {
+            send_msg(sock, "Enter Account ID to search:");
+            read(sock, buf, sizeof(buf));
+            int id = atoi(buf);
+
+            pthread_mutex_lock(&file_mutex);
+            FILE *fp = fopen(DATA_FILE, "rb");
+            Account tmp; int found = 0;
+            while (fread(&tmp, sizeof(Account), 1, fp)) {
+                if (tmp.id == id) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg),
+                             "Account ID: %d\nUser: %s\nRole: %s\nBalance: ₹%.2f\nLoan: %s",
+                             tmp.id, tmp.username, tmp.role, tmp.balance,
+                             tmp.loan_pending ? "Pending/Approved" : "None");
+                    send_msg(sock, msg);
+                    found = 1;
+                    break;
+                }
+            }
+            fclose(fp);
+            pthread_mutex_unlock(&file_mutex);
+
+            if (!found) send_msg(sock, "Account not found.");
+        }
+
+        else if (strcmp(buf, "VIEW_ALL") == 0) {
+            pthread_mutex_lock(&file_mutex);
+            FILE *fp = fopen(DATA_FILE, "rb");
+            Account tmp;
+            char msg[1024] = "";
+            while (fread(&tmp, sizeof(Account), 1, fp)) {
+                char line[256];
+                snprintf(line, sizeof(line), "ID:%d User:%s Role:%s Bal:₹%.2f Loan:%d\n",
+                         tmp.id, tmp.username, tmp.role, tmp.balance, tmp.loan_pending);
+                strcat(msg, line);
+            }
+            fclose(fp);
+            pthread_mutex_unlock(&file_mutex);
+            send_msg(sock, msg[0] ? msg : "No accounts found.");
+        }
+
+        else if (strcmp(buf, "LOGOUT") == 0) {
+            send_msg(sock, "Logging out...");
+            break;
+        }
+
+        else {
+            send_msg(sock, "Invalid admin command. Please choose from the menu.");
+        }
+
+        // ✅ Re-show menu after each command
+        send_msg(sock,
+            "\nMENU:\n"
+            "1. ADD_ACCOUNT\n"
+            "2. DELETE_ACCOUNT\n"
+            "3. MODIFY_ACCOUNT\n"
+            "4. SEARCH_ACCOUNT\n"
+            "5. VIEW_ALL\n"
+            "6. LOGOUT\n"
+            "Enter your command:"
+        );
+    }
 }
+
+
+

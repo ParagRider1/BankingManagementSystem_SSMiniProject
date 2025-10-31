@@ -28,13 +28,12 @@
 
 /* Account record */
 typedef struct {
-    int acc_no;                 // 1-based
-    int role;                   // ROLE_CUSTOMER / other roles for special accounts
-    char name[MAX_NAME];
-    char password[MAX_PASS];
-    double balance;
-    int active;                 // 1 active, 0 deleted
-    char padding[32];
+    int id;
+    char username[50];
+    char password[50];
+    char role[20];       // CUSTOMER, EMPLOYEE, MANAGER, ADMIN
+    float balance;
+    int loan_pending;    // 0 = none, 1 = requested, 2 = approved
 } Account;
 
 /* Loan record */
