@@ -7,18 +7,14 @@
 #define SERVER_IP "127.0.0.1"
 #define PORT 8080
 
-//note initial : admin username: admin123 password: 1234
-
-ssize_t readln(int fd, char *buf, size_t max) {
-    ssize_t t = 0;
-    while (t < (ssize_t)max - 1) {
-        char c; ssize_t n = read(fd, &c, 1);
-        if (n <= 0) return (t > 0) ? t : n;
-        if (c == '\n') break;
-        buf[t++] = c;
-    }
-    buf[t] = 0;
-    return t;
+// helper: send string + newline if not already present
+static void send_line(int sock, const char *s) {
+    size_t len = strlen(s);
+    if (len == 0) return;
+    // send s
+    send(sock, s, len, 0);
+    // ensure newline
+    if (s[len-1] != '\n') send(sock, "\n", 1, 0);
 }
 
 void show_customer_menu() {
@@ -62,9 +58,10 @@ int main() {
 
     printf("Connected to server %s:%d\n", SERVER_IP, PORT);
 
-    char buf[2048], role[32] = "";
+    char buf[4096];
+    char role[64] = "";
     while (1) {
-        // read full message (multi-line capable)
+        // read server data (may contain multiple lines)
         ssize_t n = recv(s, buf, sizeof(buf) - 1, 0);
         if (n <= 0) {
             printf("Server disconnected.\n");
@@ -72,82 +69,117 @@ int main() {
         }
         buf[n] = '\0';
 
-        // detect role update
-        if (strncmp(buf, "ROLE:", 5) == 0) {
-            strcpy(role, buf + 5);
-            printf("\nLogged in as %s\n", role);
-            continue;
+        // Process every line separately (handles combined ROLE+MENU etc.)
+        char *saveptr = NULL;
+        char *line = strtok_r(buf, "\n", &saveptr);
+        while (line) {
+            // trim leading/trailing spaces
+            while (*line == '\r') line++;
+            if (strncmp(line, "ROLE:", 5) == 0) {
+                // receive ROLE:NAME
+                strncpy(role, line + 5, sizeof(role)-1);
+                role[sizeof(role)-1] = '\0';
+                printf("\nLogged in as %s\n", role);
+            }
+            else if (strncmp(line, "MENU", 4) == 0 || strncmp(line, "MENU:", 5) == 0) {
+                // server is telling client to display menu
+                if (strcmp(role, "CUSTOMER") == 0) show_customer_menu();
+                else if (strcmp(role, "EMPLOYEE") == 0) show_employee_menu();
+                else if (strcmp(role, "MANAGER") == 0) show_manager_menu();
+                else if (strcmp(role, "ADMIN") == 0) show_admin_menu();
+            }
+            else {
+                // generic server message
+                printf("%s\n", line);
+            }
+            line = strtok_r(NULL, "\n", &saveptr);
         }
 
-        // detect menu trigger
-        if (strncmp(buf, "MENU", 4) == 0) {
-            if (strcmp(role, "CUSTOMER") == 0) show_customer_menu();
-            else if (strcmp(role, "EMPLOYEE") == 0) show_employee_menu();
-            else if (strcmp(role, "MANAGER") == 0) show_manager_menu();
-            else if (strcmp(role, "ADMIN") == 0) show_admin_menu();
-            continue;
-        }
-
-        // print server message cleanly
-        printf("%s", buf);
-        if (buf[strlen(buf) - 1] != '\n') printf("\n");
-
-        // exit conditions
-        if (strstr(buf, "Logging out") || strstr(buf, "Goodbye")) break;
-
-        // wait for user input
+        // If the server printed a menu, we already printed prompt. Otherwise show generic prompt.
         printf("> ");
         fflush(stdout);
+
+        // read user input
         if (!fgets(buf, sizeof(buf), stdin)) break;
         buf[strcspn(buf, "\n")] = 0;
+        if (strlen(buf) == 0) {
+            // if empty line, send a newline (or skip)
+            send_line(s, "");
+            continue;
+        }
 
-        // send input
-        send(s, buf, strlen(buf), 0);
-
-        // handle client-side menu logic
+        // If user typed numeric menu choice and role is set, translate to server token.
         int choice = atoi(buf);
-        if (strcmp(role, "CUSTOMER") == 0) {
-            switch (choice) {
-                case 1: send(s, "DEPOSIT\n", 8, 0);
+        if (role[0] != '\0' && choice > 0) {
+            // role-aware mapping
+            if (strcmp(role, "CUSTOMER") == 0) {
+                switch (choice) {
+                    case 1:
+                        send_line(s, "DEPOSIT");
                         printf("Enter amount: ");
-                        fgets(buf, sizeof(buf), stdin);
-                        send(s, buf, strlen(buf), 0);
+                        if (!fgets(buf, sizeof(buf), stdin)) break;
+                        buf[strcspn(buf, "\n")] = 0;
+                        send_line(s, buf);
                         break;
-                case 2: send(s, "WITHDRAW\n", 9, 0);
+                    case 2:
+                        send_line(s, "WITHDRAW");
                         printf("Enter amount: ");
-                        fgets(buf, sizeof(buf), stdin);
-                        send(s, buf, strlen(buf), 0);
+                        if (!fgets(buf, sizeof(buf), stdin)) break;
+                        buf[strcspn(buf, "\n")] = 0;
+                        send_line(s, buf);
                         break;
-                case 3: send(s, "BALANCE\n", 8, 0); break;
-                case 4: send(s, "APPLY_LOAN\n", 11, 0); break;
-                case 5: send(s, "VIEW\n", 5, 0); break;
-                case 6: send(s, "LOGOUT\n", 7, 0); break;
-                default: printf("Invalid choice\n"); break;
+                    case 3: send_line(s, "BALANCE"); break;
+                    case 4: send_line(s, "APPLY_LOAN"); break;
+                    case 5: send_line(s, "VIEW"); break;
+                    case 6: send_line(s, "LOGOUT"); break;
+                    default: printf("Invalid choice\n"); break;
+                }
+            } else if (strcmp(role, "EMPLOYEE") == 0) {
+                switch (choice) {
+                    case 1: send_line(s, "VIEW_PENDING"); break;
+                    case 2:
+                        send_line(s, "MARK_REVIEW");
+                        printf("Enter account id to mark reviewed: ");
+                        if (!fgets(buf, sizeof(buf), stdin)) break;
+                        buf[strcspn(buf, "\n")] = 0;
+                        send_line(s, buf);
+                        break;
+                    case 3: send_line(s, "LOGOUT"); break;
+                    default: printf("Invalid choice\n"); break;
+                }
+            } else if (strcmp(role, "MANAGER") == 0) {
+                switch (choice) {
+                    case 1: send_line(s, "LIST_REVIEWED"); break;
+                    case 2:
+                        send_line(s, "APPROVE");
+                        printf("Enter account id to approve: ");
+                        if (!fgets(buf, sizeof(buf), stdin)) break;
+                        buf[strcspn(buf, "\n")] = 0;
+                        send_line(s, buf);
+                        break;
+                    case 3: send_line(s, "LOGOUT"); break;
+                    default: printf("Invalid choice\n"); break;
+                }
+            } else if (strcmp(role, "ADMIN") == 0) {
+                switch (choice) {
+                    case 1:
+                        send_line(s, "ADD_ACCOUNT");
+                        // server will prompt for fields; the client will receive those prompts and then send responses
+                        break;
+                    case 2: send_line(s, "DELETE_ACCOUNT"); break;
+                    case 3: send_line(s, "MODIFY_ACCOUNT"); break;
+                    case 4: send_line(s, "SEARCH_ACCOUNT"); break;
+                    case 5: send_line(s, "VIEW_ALL"); break;
+                    case 6: send_line(s, "LOGOUT"); break;
+                    default: printf("Invalid choice\n"); break;
+                }
+            } else {
+                // role unknown, just send raw
+                send_line(s, buf);
             }
-        } else if (strcmp(role, "EMPLOYEE") == 0) {
-            switch (choice) {
-                case 1: send(s, "VIEW_CUSTOMER\n", 14, 0); break;
-                case 2: send(s, "PROCESS_LOAN\n", 13, 0); break;
-                case 3: send(s, "LOGOUT\n", 7, 0); break;
-                default: printf("Invalid choice\n"); break;
-            }
-        } else if (strcmp(role, "MANAGER") == 0) {
-            switch (choice) {
-                case 1: send(s, "APPROVE_LOAN\n", 13, 0); break;
-                case 2: send(s, "VIEW_ALL\n", 9, 0); break;
-                case 3: send(s, "LOGOUT\n", 7, 0); break;
-                default: printf("Invalid choice\n"); break;
-            }
-        } else if (strcmp(role, "ADMIN") == 0) {
-            switch (choice) {
-                case 1: send(s, "ADD_ACCOUNT\n", 12, 0); break;
-                case 2: send(s, "DELETE_ACCOUNT\n", 15, 0); break;
-                case 3: send(s, "MODIFY_ACCOUNT\n", 15, 0); break;
-                case 4: send(s, "SEARCH_ACCOUNT\n", 15, 0); break;
-                case 5: send(s, "VIEW_ALL\n", 9, 0); break;
-                case 6: send(s, "LOGOUT\n", 7, 0); break;
-                default: printf("Invalid choice\n"); break;
-            }
+        } else {
+            // Non-numeric input or no role yet: send raw line to server
+            send_line(s, buf);
         }
     }
 

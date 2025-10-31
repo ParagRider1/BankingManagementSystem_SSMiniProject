@@ -66,7 +66,11 @@ int find_account_by_username(const char *username, Account *acc) {
 #include "common.h"
 
 bool check_credentials(const char *username, const char *password, const char *role, Account *acc) {
-    FILE *fp = fopen("accounts.db", "rb");
+     FILE *fp = fopen(DATA_FILE, "rb");
+    if (!fp) {
+        perror("Error opening accounts data file");
+        return false;
+    }
     if (!fp) {
         perror("Error opening accounts.db");
         return false;
