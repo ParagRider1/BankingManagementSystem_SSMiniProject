@@ -1,77 +1,50 @@
+// client.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/types.h>
 #include "common.h"
 
-#define PORT 8080
 #define SERVER_IP "127.0.0.1"
+#define PORT 8080
 
-int main() {
-    int sock_fd;
-    struct sockaddr_in server_addr;
-    char send_buf[MAX_CLIENT_MSG], recv_buf[MAX_CLIENT_MSG];
-    int n;
-
-    // Create socket
-    sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd < 0) {
-        perror("Socket creation failed");
-        exit(1);
+ssize_t readln(int fd, char *buf, size_t max) {
+    ssize_t t = 0;
+    while (t < (ssize_t)max-1) {
+        char c; ssize_t n = read(fd, &c, 1);
+        if (n <= 0) return (t>0) ? t : n;
+        if (c == '\n') break;
+        buf[t++] = c;
     }
-
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    server_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
-
-    // Connect to server
-    if (connect(sock_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Connection failed");
-        exit(1);
-    }
-
-    printf("Connected to Online Banking Server.\n");
-
-    // Continuous interaction with server
-    while (1) {
-        memset(recv_buf, 0, sizeof(recv_buf));
-        n = read(sock_fd, recv_buf, sizeof(recv_buf) - 1);
-        if (n <= 0) break; // server closed connection
-        recv_buf[n] = '\0';
-        printf("%s", recv_buf);
-
-        // If prompt expected
-        if (strstr(recv_buf, "Choice:") || strstr(recv_buf, "Enter") || strstr(recv_buf, "password")) {
-            printf("> ");
-            fflush(stdout);
-            memset(send_buf, 0, sizeof(send_buf));
-            fgets(send_buf, sizeof(send_buf), stdin);
-            // Remove newline
-            send_buf[strcspn(send_buf, "\n")] = '\0';
-            write(sock_fd, send_buf, strlen(send_buf));
-        }
-    }
-
-    printf("\nDisconnected from server.\n");
-    close(sock_fd);
-    return 0;
+    buf[t] = 0;
+    return t;
 }
 
+int main() {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { perror("socket"); return 1; }
+    struct sockaddr_in srv; memset(&srv, 0, sizeof(srv));
+    srv.sin_family = AF_INET; srv.sin_port = htons(PORT);
+    inet_pton(AF_INET, SERVER_IP, &srv.sin_addr);
 
+    if (connect(s, (struct sockaddr*)&srv, sizeof(srv)) < 0) { perror("connect"); return 1; }
+    printf("Connected to server %s:%d\n", SERVER_IP, PORT);
 
+    char buf[1024];
+    while (1) {
+        ssize_t n = readln(s, buf, sizeof(buf));
+        if (n <= 0) { printf("Server disconnected\n"); break; }
+        printf("SERVER: %s\n", buf);
+        // if server said BYE or ERR or OK and expects commands, we read user input
+        printf("> ");
+        fflush(stdout);
+        if (!fgets(buf, sizeof(buf), stdin)) break;
+        // send to server
+        write(s, buf, strlen(buf)); // includes newline
+        // continue loop
+    }
 
-//note:
-/*
-All user data persisted in data/accounts.dat file.
-
-Server handles multiple clients concurrently
-
-All I/O through system calls only
-
-Supports admin, normal user, and joint account types
-
-*/
-
+    close(s);
+    return 0;
+}
