@@ -3,6 +3,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <stdbool.h>
+#include "common.h" 
+
 
 #define SERVER_IP "127.0.0.1"
 #define PORT 8080
@@ -21,27 +24,45 @@ ssize_t readln(int fd, char *buf, size_t max) {
     return t;
 }
 
+// --- UPDATED MENUS TO MATCH SERVER ---
+
 void show_customer_menu() {
     printf("\n====== CUSTOMER MENU ======\n");
-    printf("1. Deposit\n2. Withdraw\n3. Balance Enquiry\n4. Apply Loan\n5. View Details\n6. Logout\n");
+    printf("1. Deposit\n");
+    printf("2. Withdraw\n");
+    printf("3. Balance Enquiry\n");
+    printf("4. Apply Loan\n");
+    printf("5. View Details\n");
+    printf("6. Logout\n");
     printf("============================\nEnter choice: ");
 }
 
 void show_employee_menu() {
     printf("\n====== EMPLOYEE MENU ======\n");
-    printf("1. View Customer Details\n2. Process Loan Request\n3. Logout\n");
+    printf("1. View Pending Loans\n");       // Was "View Customer Details"
+    printf("2. Mark Loan as Reviewed\n"); // Was "Process Loan Request"
+    printf("3. View Specific Account\n"); // New option to match server
+    printf("4. Logout\n");
     printf("============================\nEnter choice: ");
 }
 
 void show_manager_menu() {
     printf("\n====== MANAGER MENU ======\n");
-    printf("1. Approve/Reject Loan\n2. View All Accounts\n3. Logout\n");
+    printf("1. List Reviewed Loans\n"); // Was "Approve/Reject Loan"
+    printf("2. Approve Loan\n");        
+    printf("3. Reject Loan\n");        
+    printf("4. Logout\n");             
     printf("===========================\nEnter choice: ");
 }
 
 void show_admin_menu() {
     printf("\n====== ADMIN MENU ======\n");
-    printf("1. Add Account\n2. Delete Account\n3. Modify Account\n4. Search Account\n5. View All Accounts\n6. Logout\n");
+    printf("1. Add Account\n");
+    printf("2. Delete Account\n");
+    printf("3. Modify Account\n");
+    printf("4. Search Account\n");
+    printf("5. View All Accounts\n");
+    printf("6. Logout\n");
     printf("=========================\nEnter choice: ");
 }
 
@@ -63,82 +84,132 @@ int main() {
     printf("Connected to server %s:%d\n", SERVER_IP, PORT);
 
     char buf[2048], role[32] = "";
+    char extra_input[128];
+    bool is_menu_prompt = false; // <-- State flag to fix Admin menu
+
     while (1) {
-        // read full message (multi-line capable)
+        // --- Read server message ---
         ssize_t n = recv(s, buf, sizeof(buf) - 1, 0);
         if (n <= 0) {
             printf("Server disconnected.\n");
             break;
         }
         buf[n] = '\0';
+        is_menu_prompt = false; // Reset flag each time we get a message
 
-        // detect role update
         if (strncmp(buf, "ROLE:", 5) == 0) {
-            strcpy(role, buf + 5);
+            char* role_start = buf + 5;
+            char* role_end = strpbrk(role_start, "\r\n"); // Find end of role
+            if (role_end) {
+                *role_end = '\0';
+            }
+            strcpy(role, role_start);
             printf("\nLogged in as %s\n", role);
-            continue;
+     
         }
 
-        // detect menu trigger
-        if (strncmp(buf, "MENU", 4) == 0) {
+      
+        if (strstr(buf, "MENU") != NULL) {
+            is_menu_prompt = true; // Set the flag
+
             if (strcmp(role, "CUSTOMER") == 0) show_customer_menu();
             else if (strcmp(role, "EMPLOYEE") == 0) show_employee_menu();
             else if (strcmp(role, "MANAGER") == 0) show_manager_menu();
-            else if (strcmp(role, "ADMIN") == 0) show_admin_menu();
+            else if (strcmp(role, "ADMIN") == 0) {
+                // Admin menu is sent *by* the server, so just print it.
+                printf("%s", buf);
+            }
+        } else if (strncmp(buf, "ROLE:", 5) != 0) {
+           
+            printf("%s", buf);
+            if (buf[strlen(buf) - 1] != '\n') printf("\n");
+        }
+
+        // --- Exit conditions ---
+        if (strstr(buf, "Logging out") || strstr(buf, "Connection closed")) break;
+
+        // --- Get user input ---
+        printf("> ");
+        fflush(stdout);
+        if (!fgets(buf, sizeof(buf), stdin)) break; // Get user choice, e.g., "1\n"
+
+        // --- CLIENT LOGIC ---
+
+        // If we are not logged in, just send the raw buffer (for role, user, pass)
+        if (strlen(role) == 0) {
+            send(s, buf, strlen(buf), 0);
             continue;
         }
 
-        // print server message cleanly
-        printf("%s", buf);
-        if (buf[strlen(buf) - 1] != '\n') printf("\n");
+   
+        if (strcmp(role, "ADMIN") == 0 && !is_menu_prompt) {
+            send(s, buf, strlen(buf), 0);
+            continue; // Go back to recv()
+        }
 
-        // exit conditions
-        if (strstr(buf, "Logging out") || strstr(buf, "Goodbye")) break;
-
-        // wait for user input
-        printf("> ");
-        fflush(stdout);
-        if (!fgets(buf, sizeof(buf), stdin)) break;
-        buf[strcspn(buf, "\n")] = 0;
-
-        // send input
-        send(s, buf, strlen(buf), 0);
-
-        // handle client-side menu logic
+        // --- Original Menu Choice Logic ---
+        // If we are here, it means we are logged in AND it's a menu prompt
+        
         int choice = atoi(buf);
+
         if (strcmp(role, "CUSTOMER") == 0) {
             switch (choice) {
-                case 1: send(s, "DEPOSIT\n", 8, 0);
-                        printf("Enter amount: ");
-                        fgets(buf, sizeof(buf), stdin);
-                        send(s, buf, strlen(buf), 0);
-                        break;
-                case 2: send(s, "WITHDRAW\n", 9, 0);
-                        printf("Enter amount: ");
-                        fgets(buf, sizeof(buf), stdin);
-                        send(s, buf, strlen(buf), 0);
-                        break;
+                case 1: // Deposit
+                    send(s, "DEPOSIT\n", 8, 0);
+                    printf("Enter amount: ");
+                    fgets(extra_input, sizeof(extra_input), stdin);
+                    send(s, extra_input, strlen(extra_input), 0);
+                    break;
+                case 2: // Withdraw
+                    send(s, "WITHDRAW\n", 9, 0);
+                    printf("Enter amount: ");
+                    fgets(extra_input, sizeof(extra_input), stdin);
+                    send(s, extra_input, strlen(extra_input), 0);
+                    break;
                 case 3: send(s, "BALANCE\n", 8, 0); break;
                 case 4: send(s, "APPLY_LOAN\n", 11, 0); break;
                 case 5: send(s, "VIEW\n", 5, 0); break;
                 case 6: send(s, "LOGOUT\n", 7, 0); break;
-                default: printf("Invalid choice\n"); break;
+                default: send(s, "INVALID\n", 8, 0); break;
             }
         } else if (strcmp(role, "EMPLOYEE") == 0) {
             switch (choice) {
-                case 1: send(s, "VIEW_CUSTOMER\n", 14, 0); break;
-                case 2: send(s, "PROCESS_LOAN\n", 13, 0); break;
-                case 3: send(s, "LOGOUT\n", 7, 0); break;
-                default: printf("Invalid choice\n"); break;
+                case 1: send(s, "VIEW_PENDING\n", 13, 0); break;
+                case 2: 
+                    send(s, "MARK_REVIEW\n", 12, 0);
+                    printf("Enter Account ID to mark as reviewed: ");
+                    fgets(extra_input, sizeof(extra_input), stdin);
+                    send(s, extra_input, strlen(extra_input), 0);
+                    break;
+                case 3:
+                    send(s, "VIEW_ACCOUNT\n", 13, 0);
+                    printf("Enter Account ID to view: ");
+                    fgets(extra_input, sizeof(extra_input), stdin);
+                    send(s, extra_input, strlen(extra_input), 0);
+                    break;
+                case 4: send(s, "LOGOUT\n", 7, 0); break;
+                default: send(s, "INVALID\n", 8, 0); break;
             }
         } else if (strcmp(role, "MANAGER") == 0) {
             switch (choice) {
-                case 1: send(s, "APPROVE_LOAN\n", 13, 0); break;
-                case 2: send(s, "VIEW_ALL\n", 9, 0); break;
-                case 3: send(s, "LOGOUT\n", 7, 0); break;
-                default: printf("Invalid choice\n"); break;
+                case 1: send(s, "LIST_REVIEWED\n", 14, 0); break;
+                case 2:
+                    send(s, "APPROVE\n", 8, 0);
+                    printf("Enter Account ID to approve: ");
+                    fgets(extra_input, sizeof(extra_input), stdin);
+                    send(s, extra_input, strlen(extra_input), 0);
+                    break;
+                case 3:
+                    send(s, "REJECT\n", 7, 0);
+                    printf("Enter Account ID to reject: ");
+                    fgets(extra_input, sizeof(extra_input), stdin);
+                    send(s, extra_input, strlen(extra_input), 0);
+                    break;
+                case 4: send(s, "LOGOUT\n", 7, 0); break;
+                default: send(s, "INVALID\n", 8, 0); break;
             }
         } else if (strcmp(role, "ADMIN") == 0) {
+            // This is now ONLY for the main menu choice
             switch (choice) {
                 case 1: send(s, "ADD_ACCOUNT\n", 12, 0); break;
                 case 2: send(s, "DELETE_ACCOUNT\n", 15, 0); break;
@@ -146,10 +217,10 @@ int main() {
                 case 4: send(s, "SEARCH_ACCOUNT\n", 15, 0); break;
                 case 5: send(s, "VIEW_ALL\n", 9, 0); break;
                 case 6: send(s, "LOGOUT\n", 7, 0); break;
-                default: printf("Invalid choice\n"); break;
+                default: send(s, "INVALID\n", 8, 0); break;
             }
         }
-    }
+    } // end while
 
     close(s);
     return 0;

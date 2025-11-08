@@ -19,7 +19,7 @@ void handle_admin(int sock, Account *acc);
 
 
 #define PORT 8080
-#define DATA_FILE "accounts.dat"
+
 
 // typedef struct {
 //     int id;
@@ -47,7 +47,7 @@ pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
 int find_account_by_username(const char *username, Account *acc) {
-    FILE *fp = fopen(DATA_FILE, "rb");
+    FILE *fp = fopen(DB_ACC_FILE, "rb");
     if (!fp) return 0;
     while (fread(acc, sizeof(Account), 1, fp)) {
         if (strcmp(acc->username, username) == 0) {
@@ -65,9 +65,11 @@ int find_account_by_username(const char *username, Account *acc) {
 #include <stdbool.h>
 #include "common.h"
 
+
 bool check_credentials(const char *username, const char *password, const char *role, Account *acc) {
-    FILE *fp = fopen("accounts.db", "rb");
+   FILE *fp = fopen(DB_ACC_FILE, "rb");
     if (!fp) {
+
         perror("Error opening accounts.db");
         return false;
     }
@@ -214,7 +216,8 @@ void *client_handler(void *arg) {
 
 void update_account(Account *acc) {
     pthread_mutex_lock(&file_mutex);
-    FILE *fp = fopen(DATA_FILE, "r+b");
+    //FILE *fp = fopen(DATA_FILE, "r+b");
+    FILE *fp = fopen(DB_ACC_FILE, "r+b");
     if (!fp) { pthread_mutex_unlock(&file_mutex); return; }
     Account tmp;
     while (fread(&tmp, sizeof(Account), 1, fp)) {
@@ -236,11 +239,17 @@ void handle_customer(int sock, Account *acc) {
         if (n <= 0) break;
         buf[n] = 0;
         buf[strcspn(buf, "\r\n")] = 0;
+        
+         printf("\n====== CUSTOMER MENU ======\n");
+        printf("1. Deposit\n2. Withdraw\n3. Balance Enquiry\n4. Apply Loan\n5. View Details\n6. Logout\n");
+        printf("============================\nEnter choice: ");
+        
 
         if (strcmp(buf, "DEPOSIT") == 0) {
             read(sock, buf, sizeof(buf));
             float amt = atof(buf);
-            int fd = open(DATA_FILE, O_RDWR);
+            //int fd = open(DATA_FILE, O_RDWR);
+            int fd = open(DB_ACC_FILE, O_RDWR);
             flock(fd, LOCK_EX);             // write lock
             acc->balance += amt;
             update_account(acc);
@@ -252,7 +261,7 @@ void handle_customer(int sock, Account *acc) {
         else if (strcmp(buf, "WITHDRAW") == 0) {
             read(sock, buf, sizeof(buf));
             float amt = atof(buf);
-            int fd = open(DATA_FILE, O_RDWR);
+            int fd = open(DB_ACC_FILE, O_RDWR);
             flock(fd, LOCK_EX);
             if (acc->balance >= amt) {
                 acc->balance -= amt;
@@ -305,7 +314,7 @@ void handle_customer(int sock, Account *acc) {
 // Find account by numeric id (returns 1 if found and fills acc_out, 0 otherwise)
 int find_account_by_id(int id, Account *acc_out) {
     pthread_mutex_lock(&file_mutex);
-    FILE *fp = fopen(DATA_FILE, "rb");
+    FILE *fp = fopen(DB_ACC_FILE, "rb");
     if (!fp) { pthread_mutex_unlock(&file_mutex); return 0; }
     Account tmp;
     int found = 0;
@@ -325,7 +334,7 @@ int find_account_by_id(int id, Account *acc_out) {
 int credit_account_by_id(int id, double amount) {
     // load account, lock and update
     pthread_mutex_lock(&file_mutex);
-    FILE *fp = fopen(DATA_FILE, "r+b");
+    FILE *fp = fopen(DB_ACC_FILE, "r+b");
     if (!fp) { pthread_mutex_unlock(&file_mutex); return -1; }
     Account tmp;
     int success = 0;
@@ -361,10 +370,13 @@ void handle_employee(int sock, Account *self) {
         // "MARK_REVIEW"       -> next line: account id to mark as reviewed (set loan_pending=2)
         // "VIEW_ACCOUNT"      -> next line: account id to display
         // "LOGOUT"
-
+         printf("\n====== CUSTOMER MENU ======\n");
+        printf("1. VIEW_PENDING\n2. MARK_REVIEW \n3.VIEW_ACCOUNT\n4. LOGOUT\n");
+        printf("============================\nEnter choice: like(VIEW_PENDING)");
+        
         if (strcmp(buf, "VIEW_PENDING") == 0) {
             pthread_mutex_lock(&file_mutex);
-            FILE *fp = fopen(DATA_FILE, "rb");
+            FILE *fp = fopen(DB_ACC_FILE, "rb");
             if (!fp) {
                 pthread_mutex_unlock(&file_mutex);
                 send_msg(sock, "Failed to open accounts file.");
@@ -396,7 +408,7 @@ void handle_employee(int sock, Account *self) {
             }
             // lock file and update target.loan_pending -> 2 (reviewed)
             pthread_mutex_lock(&file_mutex);
-            FILE *fp = fopen(DATA_FILE, "r+b");
+            FILE *fp = fopen(DB_ACC_FILE, "r+b");
             if (!fp) { pthread_mutex_unlock(&file_mutex); send_msg(sock, "Failed to open file."); continue; }
             Account tmp;
             int done = 0;
@@ -458,7 +470,7 @@ void handle_manager(int sock, Account *self) {
 
         if (strcmp(buf, "LIST_REVIEWED") == 0) {
             pthread_mutex_lock(&file_mutex);
-            FILE *fp = fopen(DATA_FILE, "rb");
+            FILE *fp = fopen(DB_ACC_FILE, "rb");
             if (!fp) { pthread_mutex_unlock(&file_mutex); send_msg(sock, "Failed to open file."); continue; }
             Account tmp; int any = 0;
             while (fread(&tmp, sizeof(Account), 1, fp) == 1) {
@@ -485,7 +497,7 @@ void handle_manager(int sock, Account *self) {
 
             // update account: set loan_pending=3 (approved) and credit amount
             pthread_mutex_lock(&file_mutex);
-            FILE *fp = fopen(DATA_FILE, "r+b");
+            FILE *fp = fopen(DB_ACC_FILE, "r+b");
             if (!fp) { pthread_mutex_unlock(&file_mutex); send_msg(sock, "Failed to open file."); continue; }
             Account tmp; int done = 0;
             while (fread(&tmp, sizeof(Account), 1, fp) == 1) {
@@ -511,7 +523,7 @@ void handle_manager(int sock, Account *self) {
             buf[strcspn(buf, "\r\n")] = 0;
             int id = atoi(buf);
             pthread_mutex_lock(&file_mutex);
-            FILE *fp = fopen(DATA_FILE, "r+b");
+            FILE *fp = fopen(DB_ACC_FILE, "r+b");
             if (!fp) { pthread_mutex_unlock(&file_mutex); send_msg(sock, "Failed to open file."); continue; }
             Account tmp; int done = 0;
             while (fread(&tmp, sizeof(Account), 1, fp) == 1) {
@@ -564,26 +576,42 @@ void handle_admin(int sock, Account *acc) {
 
         if (strcmp(buf, "ADD_ACCOUNT") == 0) {
             Account newAcc;
+            // FIX 1: Initialize the struct to all zeros.
+            // This prevents garbage data if a read fails.
+            memset(&newAcc, 0, sizeof(Account));
+
             send_msg(sock, "Enter ID:");
-            read(sock, buf, sizeof(buf)); newAcc.id = atoi(buf);
+            // FIX 2: Use a safe read
+            ssize_t n = read(sock, buf, sizeof(buf) - 1);
+            if (n <= 0) break;
+            buf[n] = '\0';
+            newAcc.id = atoi(buf);
 
             send_msg(sock, "Enter Username:");
-            read(sock, newAcc.username, sizeof(newAcc.username));
-            newAcc.username[strcspn(newAcc.username, "\r\n")] = 0;
+            // FIX 3: Read directly into the struct, -1 for null terminator
+            n = read(sock, newAcc.username, sizeof(newAcc.username) - 1);
+            if (n <= 0) break;
+            newAcc.username[n] = '\0'; // Manually null-terminate
+            newAcc.username[strcspn(newAcc.username, "\r\n")] = 0; // Clean newline
 
             send_msg(sock, "Enter Password:");
-            read(sock, newAcc.password, sizeof(newAcc.password));
+            // FIX 4: Safe read
+            n = read(sock, newAcc.password, sizeof(newAcc.password) - 1);
+            if (n <= 0) break;
+            newAcc.password[n] = '\0';
             newAcc.password[strcspn(newAcc.password, "\r\n")] = 0;
 
             send_msg(sock, "Enter Role (CUSTOMER/EMPLOYEE/MANAGER):");
-            read(sock, newAcc.role, sizeof(newAcc.role));
+            // FIX 5: Safe read
+            n = read(sock, newAcc.role, sizeof(newAcc.role) - 1);
+            if (n <= 0) break;
+            newAcc.role[n] = '\0';
             newAcc.role[strcspn(newAcc.role, "\r\n")] = 0;
 
-            newAcc.balance = 0;
-            newAcc.loan_pending = 0;
+            // newAcc.balance and loan_pending are already 0 from the memset
 
             pthread_mutex_lock(&file_mutex);
-            FILE *fp = fopen(DATA_FILE, "ab");
+            FILE *fp = fopen(DB_ACC_FILE, "ab");
             fwrite(&newAcc, sizeof(Account), 1, fp);
             fclose(fp);
             pthread_mutex_unlock(&file_mutex);
@@ -597,7 +625,7 @@ void handle_admin(int sock, Account *acc) {
             int delId = atoi(buf);
 
             pthread_mutex_lock(&file_mutex);
-            FILE *fp = fopen(DATA_FILE, "rb");
+            FILE *fp = fopen(DB_ACC_FILE, "rb");
             FILE *temp = fopen("temp.dat", "wb");
             Account tmp; int found = 0;
             while (fread(&tmp, sizeof(Account), 1, fp)) {
@@ -605,7 +633,7 @@ void handle_admin(int sock, Account *acc) {
                 else fwrite(&tmp, sizeof(tmp), 1, temp);
             }
             fclose(fp); fclose(temp);
-            remove(DATA_FILE); rename("temp.dat", DATA_FILE);
+            remove(DB_ACC_FILE); rename("temp.dat", DB_ACC_FILE);
             pthread_mutex_unlock(&file_mutex);
 
             send_msg(sock, found ? "Account deleted." : "Account not found.");
@@ -617,7 +645,7 @@ void handle_admin(int sock, Account *acc) {
             int id = atoi(buf);
 
             pthread_mutex_lock(&file_mutex);
-            FILE *fp = fopen(DATA_FILE, "r+b");
+            FILE *fp = fopen(DB_ACC_FILE, "r+b");
             Account tmp; int found = 0;
             while (fread(&tmp, sizeof(Account), 1, fp)) {
                 if (tmp.id == id) {
@@ -642,7 +670,7 @@ void handle_admin(int sock, Account *acc) {
             int id = atoi(buf);
 
             pthread_mutex_lock(&file_mutex);
-            FILE *fp = fopen(DATA_FILE, "rb");
+            FILE *fp = fopen(DB_ACC_FILE, "rb");
             Account tmp; int found = 0;
             while (fread(&tmp, sizeof(Account), 1, fp)) {
                 if (tmp.id == id) {
@@ -664,7 +692,7 @@ void handle_admin(int sock, Account *acc) {
 
         else if (strcmp(buf, "VIEW_ALL") == 0) {
             pthread_mutex_lock(&file_mutex);
-            FILE *fp = fopen(DATA_FILE, "rb");
+            FILE *fp = fopen(DB_ACC_FILE, "rb");
             Account tmp;
             char msg[1024] = "";
             while (fread(&tmp, sizeof(Account), 1, fp)) {
